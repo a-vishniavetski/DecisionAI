@@ -2,7 +2,45 @@
 import { useState, useEffect } from 'react'
 
 function App() {
-  const [message, setMessage] = useState('Loading...')
+  const [message, setMessage] = useState('')
+  const [responses, setResponses] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  const  handleSubmit = async (e) => {
+    e.preventDefault()
+
+    console.log("unga bunga")
+
+    if (!message.trim()) return
+
+    setLoading(true)
+
+    try {
+      const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {
+              'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ user_question: message })
+      })
+      
+      if (!response.ok) {
+          throw new Error('API request failed')
+      }
+      
+      const data = await response.json()
+      setResponses(data.response)  
+      setMessage('')  
+        
+    } catch (error) {
+        console.error('Error:', error)
+        alert('Something went wrong!')
+        
+    } finally {
+        console.log(message)
+        setLoading(false)  // Hide loading state
+    }
+  }
 
   useEffect(() => {
     fetch('/api/hello')
@@ -15,11 +53,14 @@ function App() {
     <div style={{ padding: '2rem', textAlign: 'center' }}>
       <h1>🚀 FastAPI + React</h1>
       <p>Frontend: Hello from React!</p>
-      <p>Backend: {message}</p>
+      <p>Backend: {responses}</p>
       <div style={{ marginTop: '2rem', color: '#666' }}>
-        <p>✅ Single Docker container</p>
-        <p>✅ FastAPI backend serving API</p>
-        <p>✅ React frontend making API calls</p>
+
+      <form onSubmit={handleSubmit}>
+        <input type="text" value={message} />
+        <button type="submit">Send decision request</button>
+      </form>
+
       </div>
     </div>
   )
