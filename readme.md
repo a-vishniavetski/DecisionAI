@@ -1,0 +1,1 @@
+Simple Pet Project, using LLM to help with making decisions.
