@@ -1,13 +1,10 @@
 import os
-import json
 from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from prompts import EXTRACTOR_PROMPT
 
 # =======================
 # STATE
@@ -23,55 +20,35 @@ class State(TypedDict):
 os.environ["LANGSMITH_TRACKING"] = os.getenv("LANGSMITH_TRACKING", "true")
 BASE_MODEL = os.environ.get("GOOGLE_MODEL_CODENAME", "gemini-2.0-flash-lite")
 
-# System prompts for each side
-PRO_SYSTEM_PROMPT = """You are the PRO advocate in a debate. Your role is to argue for the positive position on any given question. 
-Build the strongest case possible for your side. Consider this a formal debate that you need to win.
-Your opponent will argue the opposite side, and it's his responsibility to attack you, not yours to find faults in your own argument.
+# Shared system prompt
+BASE_SYSTEM_PROMPT = """You are participating in a formal debate. The goal is to choose a decision from a binary choice, based on the input information provided.
+Build the strongest case possible for your assigned side. 
+Don't try to find flaws in your own position - Your opponent will argue the opposite side, and it's his responsibility to do so.
+Consider this a debate that you need to win. 
 Be concise and persuasive: answer with a short intro, then outline your arguments as self-contained points, then outro that summarizes your position.
-Focus on benefits, advantages, and positive aspects of the topic."""
 
-CON_SYSTEM_PROMPT = """You are the CON advocate in a debate. Your role is to argue for the negative position on any given question.
-Build the strongest case possible for your side. Consider this a formal debate that you need to win.
-Your opponent will argue the opposite side, and it's his responsibility to attack you, not yours to find faults in your own argument.
-Be concise and persuasive: answer with a short intro, then outline your arguments as self-contained points, then outro that summarizes your position.
-Focus on drawbacks, disadvantages, and negative aspects of the topic."""
+This is how the debate works: The PRO side presents their position first, arguing for the positive/affirmative position. 
+The CON side then responds, arguing for the negative position and can directly counter the PRO arguments.
 
-# Extractor uses tool calling
-@tool
-def extract_pro_con(question: str) -> dict:
-    """Extracts pro and con positions from a binary decision question."""
-    return {"pro": "Positive side argument", "con": "Negative side argument"}
+Do not make addresses, greetings, or apologies. Focus solely on the arguments."""
 
-extractor_llm = ChatGoogleGenerativeAI(
-    model=BASE_MODEL,
-    temperature=0,
-    max_output_tokens=200,
-)
+# Judge system prompt
+JUDGE_SYSTEM_PROMPT = """You are an impartial judge in a formal debate. 
+Your task is to evaluate the strength of the arguments presented by both sides and determine 
+the winner based on the quality of their reasoning and evidence, and those alone.
+
+Be consice, objective and present the user with the final decision."""
 
 # Advocates are plain chat models
 pro_llm = ChatGoogleGenerativeAI(model=BASE_MODEL, temperature=0, max_output_tokens=250)
 con_llm = ChatGoogleGenerativeAI(model=BASE_MODEL, temperature=0, max_output_tokens=250)
+judge_llm = ChatGoogleGenerativeAI(model=BASE_MODEL, temperature=0, max_output_tokens=300)
 
 # =======================
 # NODES
 # =======================
-def extractor(state: State):
-    """Extract pro and con. Halt if not applicable."""
-    user_msg = state["messages"][-1].content
-    prompt = EXTRACTOR_PROMPT.format(user_msg=user_msg)
-    result = extractor_llm.invoke(prompt)
-    try:
-        result_dict = json.loads(result.content)
-        pro = result_dict.get("pro", "").strip()
-        con = result_dict.get("con", "").strip()
-    except json.JSONDecodeError:
-        pro, con = "", ""
-    
-    # Ensure valid dict is returned
-    return {"pro": pro, "con": con}
-
 def pro_node(state: State):
-    """PRO advocate node with system message and only the original question"""
+    """PRO advocate node - presents the opening position"""
     # Get the original human question
     original_question = None
     for msg in state["messages"]:
@@ -82,49 +59,93 @@ def pro_node(state: State):
     if not original_question:
         original_question = state["messages"][-1].content
     
-    # Create messages with system prompt and only the original question
+    # Create messages with system prompt, side assignment, and original question
     messages = [
-        SystemMessage(content=PRO_SYSTEM_PROMPT),
-        HumanMessage(content=original_question)
+        SystemMessage(content=BASE_SYSTEM_PROMPT),
+        HumanMessage(content=f"Your side: PRO\n\nDebate question: {original_question}")
     ]
     
     res = pro_llm.invoke(messages)
     return {"messages": [res]}
 
 def con_node(state: State):
-    """CON advocate node with system message and only the original question"""
+    """CON advocate node - responds to PRO and argues against"""
     # Get the original human question
     original_question = None
+    pro_argument = None
+    
     for msg in state["messages"]:
         if isinstance(msg, HumanMessage):
             original_question = msg.content
-            break
+        elif isinstance(msg, AIMessage) and pro_argument is None:
+            # First AI message should be from PRO
+            pro_argument = msg.content
     
     if not original_question:
         original_question = state["messages"][-1].content
     
-    # Create messages with system prompt and only the original question
+    # Create messages with system prompt, side assignment, original question, and PRO argument to counter
+    prompt_content = f"Your side: CON\n\nDebate question: {original_question}"
+    if pro_argument:
+        prompt_content += f"\n\nThe PRO side has argued:\n{pro_argument}\n\nNow present your counter-argument."
+    
     messages = [
-        SystemMessage(content=CON_SYSTEM_PROMPT),
-        HumanMessage(content=original_question)
+        SystemMessage(content=BASE_SYSTEM_PROMPT),
+        HumanMessage(content=prompt_content)
     ]
     
     res = con_llm.invoke(messages)
+    return {"messages": [res]}
+
+
+def judge_node(state: State):
+    """Judge node - evaluates both sides and declares a winner"""
+    # Get the original human question, PRO argument, and CON argument
+    original_question = None
+    pro_argument = None
+    con_argument = None
+    
+    for msg in state["messages"]:
+        if isinstance(msg, HumanMessage):
+            original_question = msg.content
+        elif isinstance(msg, AIMessage):
+            if pro_argument is None:
+                pro_argument = msg.content
+            elif con_argument is None:
+                con_argument = msg.content
+    
+    if not original_question:
+        original_question = state["messages"][-1].content
+    
+    # Create messages with system prompt, original question, PRO argument, and CON argument
+    prompt_content = f"Debate question: {original_question}\n\n"
+    if pro_argument:
+        prompt_content += f"PRO side argued:\n{pro_argument}\n\n"
+    if con_argument:
+        prompt_content += f"CON side argued:\n{con_argument}\n\n"
+    
+    prompt_content += "Based on the arguments presented, evaluate the strength of each side and declare the winner (PRO or CON). Provide a brief explanation for your decision. End your message with a 'You should ...' and then spell out the decision."
+    
+    messages = [
+        SystemMessage(content=JUDGE_SYSTEM_PROMPT),
+        HumanMessage(content=prompt_content)
+    ]
+    
+    res = judge_llm.invoke(messages)
     return {"messages": [res]}
 
 # =======================
 # GRAPH
 # =======================
 graph_builder = StateGraph(State)
-# graph_builder.add_node("extractor", extractor)
 graph_builder.add_node("pro", pro_node)
 graph_builder.add_node("con", con_node)
+graph_builder.add_node("judge", judge_node)
 
-# graph_builder.add_edge(START, "extractor")
-# graph_builder.add_edge("extractor", "pro")
 graph_builder.add_edge(START, "pro")
 graph_builder.add_edge("pro", "con")
-graph_builder.add_edge("con", END)
+graph_builder.add_edge("con", "judge")
+graph_builder.add_edge("judge", END)
 
 graph = graph_builder.compile()
 
@@ -142,12 +163,17 @@ def stream_graph_updates(user_input: str):
         for node_name, value in event.items():
             if "messages" in value:
                 # Identify which side is speaking
-                side = "PRO" if node_name == "pro" else "CON"
+                if node_name == "pro":
+                    side = "PRO" 
+                elif node_name == "con":
+                    side = "CON"
+                elif node_name == "judge":
+                    side = "JUDGE"
                 print(f"{side} Argument:", value["messages"][-1].content)
                 print("-" * 50)
 
 if __name__ == "__main__":
-    user_input = "Do you think Lay's chips are healthy?"
-    print("Debate Question:", user_input)
+    # user_input = "Do you think Lay's chips are healthy?"
+    user_input = input("Enter a debate question: ")
     print("=" * 50)
     stream_graph_updates(user_input)
