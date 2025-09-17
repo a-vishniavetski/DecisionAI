@@ -5,6 +5,9 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 
+from _llm import make_response
+
+
 class DecisionRequest(BaseModel):
     user_question: str
 
@@ -20,8 +23,9 @@ async def hello():
 @app.post("/api/chat")
 async def chat(request: DecisionRequest):
     user_question = request.user_question
-    # Here you would integrate with your decision-making logic
-    response = f"Received your question: {user_question}"
+
+    response = make_response(user_question)
+
     return DecisionResponse(response=response)
 
 @app.get("/api/health")
